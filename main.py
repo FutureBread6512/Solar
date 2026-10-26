@@ -5,6 +5,9 @@ from plotly.subplots import make_subplots
 from datetime import timedelta, datetime
 import warnings
 import os
+import webbrowser
+import time
+import xgboost as xgb
 
 from openstef_core.datasets import TimeSeriesDataset
 from openstef_core.types import LeadTime, Q
@@ -41,21 +44,40 @@ def load_custom_data(csv_path: str) -> TimeSeriesDataset:
 print("Загрузка данных...")
 dataset = load_custom_data("2107_hourly_apr_jul_2024.csv")
 
-# ==========================================
-# 2. НАИВНЫЙ ПРОГНОЗ
-# ==========================================
-df_naive = dataset.data[["solar_generation", "shortwave_radiation"]].copy()
-df_naive["solar_naive"] = df_naive["solar_generation"].shift(24)
-df_naive.loc[df_naive["shortwave_radiation"] < 50, "solar_naive"] = 0.0
-
-# ==========================================
-# 3. ОБУЧЕНИЕ ML-МОДЕЛИ
-# ==========================================
-print("Обучение ML-модели (XGBoost)...")
+# Определяем периоды
 train_end = datetime.fromisoformat("2024-06-01T00:00:00Z")
 predict_end = datetime.fromisoformat("2024-06-10T00:00:00Z")
-
 train_dataset = dataset.filter_by_range(start=None, end=train_end)
+
+# ==========================================
+# МЕТОД 1: ИСТОРИЧЕСКАЯ (Persistence)
+# ==========================================
+print("Расчет М1 (Историческая)...")
+df_naive = dataset.data[["solar_generation", "shortwave_radiation"]].copy()
+df_naive["m1_historical"] = df_naive["solar_generation"].shift(24)
+df_naive.loc[df_naive["shortwave_radiation"] < 50, "m1_historical"] = 0.0
+
+# ==========================================
+# МЕТОД 2: КЛИМАТИЧЕСКАЯ (Только погода, без лагов)
+# ==========================================
+print("Обучение М2 (Климатическая)...")
+m2_features = ["shortwave_radiation", "temperature_2m", "wind_speed_10m"]
+# Берем только погодные признаки
+X_train_m2 = train_dataset.data[m2_features].fillna(0)
+y_train_m2 = train_dataset.data["solar_generation"]
+
+model_m2 = xgb.XGBRegressor(n_estimators=50, max_depth=4, random_state=42)
+model_m2.fit(X_train_m2, y_train_m2)
+
+# Предсказание для М2 на всем датасете
+X_all_m2 = dataset.data[m2_features].fillna(0)
+m2_predictions = model_m2.predict(X_all_m2)
+m2_predictions = np.clip(m2_predictions, 0, None) # Убираем отрицательные
+
+# ==========================================
+# МЕТОД 3: КОМБИНИРОВАННАЯ (OpenSTEF XGBoost)
+# ==========================================
+print("Обучение М3 (Комбинированная - OpenSTEF)...")
 predict_dataset = dataset.filter_by_range(
     start=train_end - timedelta(days=14),
     end=predict_end,
@@ -81,121 +103,120 @@ workflow.fit(train_dataset)
 ml_forecast = workflow.predict(predict_dataset, forecast_start=train_end)
 
 # ==========================================
-# 4. ФИЗИЧЕСКАЯ ОЧИСТКА
+# 4. СБОР РЕЗУЛЬТАТОВ И ОЧИСТКА
 # ==========================================
 results = dataset.data[["solar_generation", "shortwave_radiation"]].copy()
-results["solar_naive"] = df_naive["solar_naive"]
-results["solar_ml"] = ml_forecast.data['quantile_P50']
-results["solar_ml"] = results["solar_ml"].clip(lower=0.0)
-results.loc[results["shortwave_radiation"] < 50, "solar_ml"] = 0.0
+results["m1_historical"] = df_naive["m1_historical"]
+results["m2_climatic"] = m2_predictions
+results["m3_combined"] = ml_forecast.data['quantile_P50']
+
+# Физическая очистка: ночью генерация = 0
+for col in ["m2_climatic", "m3_combined"]:
+    results[col] = results[col].clip(lower=0.0)
+    results.loc[results["shortwave_radiation"] < 50, col] = 0.0
 
 start_plot = pd.Timestamp("2024-06-03 00:00:00", tz="UTC")
 end_plot = pd.Timestamp("2024-06-09 23:59:59", tz="UTC")
 results_june = results.loc[start_plot:end_plot].dropna()
 
 # ==========================================
-# 5. РАСЧЕТ МЕТРИК
+# 5. РАСЧЕТ МЕТРИК ДЛЯ ВСЕХ ТРЕХ МЕТОДОВ
 # ==========================================
 daytime_mask = results_june["solar_generation"] > 0
 y_true = results_june["solar_generation"][daytime_mask]
-y_naive = results_june["solar_naive"][daytime_mask]
-y_ml = results_june["solar_ml"][daytime_mask]
 
-mae_naive = np.mean(np.abs(y_true - y_naive))
-mae_ml = np.mean(np.abs(y_true - y_ml))
-rmse_naive = np.sqrt(np.mean((y_true - y_naive) ** 2))
-rmse_ml = np.sqrt(np.mean((y_true - y_ml) ** 2))
-max_naive = np.max(np.abs(y_true - y_naive))
-max_ml = np.max(np.abs(y_true - y_ml))
+def calc_metrics(y_pred):
+    mae = np.mean(np.abs(y_true - y_pred))
+    rmse = np.sqrt(np.mean((y_true - y_pred) ** 2))
+    max_err = np.max(np.abs(y_true - y_pred))
+    return mae, rmse, max_err
+
+mae_m1, rmse_m1, max_m1 = calc_metrics(results_june["m1_historical"][daytime_mask])
+mae_m2, rmse_m2, max_m2 = calc_metrics(results_june["m2_climatic"][daytime_mask])
+mae_m3, rmse_m3, max_m3 = calc_metrics(results_june["m3_combined"][daytime_mask])
+
 mean_actual = np.mean(y_true)
 max_actual = np.max(y_true)
-improvement = (mae_naive - mae_ml) / mae_naive * 100
 
 # ==========================================
-# 6. ПОСТРОЕНИЕ ГРАФИКА + ТАБЛИЦА
+# 6. ПОСТРОЕНИЕ ТРЕХ ГРАФИКОВ И ТАБЛИЦЫ
 # ==========================================
 fig = make_subplots(
-    rows=2, cols=1,
+    rows=4, cols=1,
     shared_xaxes=True,
-    vertical_spacing=0.15,
+    vertical_spacing=0.08,
     subplot_titles=(
-        "Сравнение реальной выработки и прогнозов",
-        "Сравнительный анализ ошибок (Только дневное время)"
+        "<b>1. М1: Историческая модель vs Факт</b>",
+        "<b>2. М2: Климатическая модель (только погода) vs Факт</b>",
+        "<b>3. М3: Комбинированная модель (погода + история) vs Факт</b>",
+        "<b>4. Сравнительный анализ ошибок (Только дневное время)</b>"
     ),
-    row_heights=[0.65, 0.35],
-    specs=[[{"type": "xy"}], [{"type": "domain"}]]
+    row_heights=[0.2, 0.2, 0.2, 0.4],
+    specs=[[{"type": "xy"}], [{"type": "xy"}], [{"type": "xy"}], [{"type": "domain"}]]
 )
 
-fig.add_trace(go.Scatter(
-    x=results_june.index, y=results_june["solar_generation"],
-    mode="lines", name="Факт (Реальность)",
-    line=dict(color="#000000", width=3)
-), row=1, col=1)
+# --- ГРАФИК 1: ФАКТ vs М1 ---
+fig.add_trace(go.Scatter(x=results_june.index, y=results_june["solar_generation"],
+    mode="lines", name="Факт", line=dict(color="#000000", width=3)), row=1, col=1)
+fig.add_trace(go.Scatter(x=results_june.index, y=results_june["m1_historical"],
+    mode="lines", name="М1 (Историческая)", line=dict(color="#ea580c", width=2, dash="dash")), row=1, col=1)
 
-fig.add_trace(go.Scatter(
-    x=results_june.index, y=results_june["solar_ml"],
-    mode="lines", name="ML-прогноз (XGBoost)",
-    line=dict(color="#059669", width=2.5)
-), row=1, col=1)
+# --- ГРАФИК 2: ФАКТ vs М2 ---
+fig.add_trace(go.Scatter(x=results_june.index, y=results_june["solar_generation"],
+    mode="lines", name="Факт", line=dict(color="#000000", width=3), showlegend=False), row=2, col=1)
+fig.add_trace(go.Scatter(x=results_june.index, y=results_june["m2_climatic"],
+    mode="lines", name="М2 (Климатическая)", line=dict(color="#8b5cf6", width=2, dash="dot")), row=2, col=1)
 
-fig.add_trace(go.Scatter(
-    x=results_june.index, y=results_june["solar_naive"],
-    mode="lines", name="Наивный прогноз",
-    line=dict(color="#ea580c", width=2, dash="dash")
-), row=1, col=1)
+# --- ГРАФИК 3: ФАКТ vs М3 ---
+fig.add_trace(go.Scatter(x=results_june.index, y=results_june["solar_generation"],
+    mode="lines", name="Факт", line=dict(color="#000000", width=3), showlegend=False), row=3, col=1)
+fig.add_trace(go.Scatter(x=results_june.index, y=results_june["m3_combined"],
+    mode="lines", name="М3 (Комбинированная)", line=dict(color="#059669", width=2.5)), row=3, col=1)
 
+# --- ГРАФИК 4: ТАБЛИЦА ---
 fig.add_trace(
     go.Table(
         header=dict(
-            values=[
-                "<b>Модель</b>",
-                "<b>MAE (кВт)</b>",
-                "<b>RMSE (кВт)</b>",
-                "<b>Макс. ошибка (кВт)</b>",
-                "<b>Ср. факт (кВт)</b>",
-                "<b>Макс. факт (кВт)</b>"
-            ],
-            fill_color='#f3f4f6',
-            align='center',
-            font=dict(size=14, color='black')
+            values=["<b>Метод</b>", "<b>MAE (кВт)</b>", "<b>RMSE (кВт)</b>", "<b>Макс. ошибка (кВт)</b>", "<b>Ср. факт (кВт)</b>", "<b>Макс. факт (кВт)</b>"],
+            fill_color='#f3f4f6', align='center', font=dict(size=14, color='black')
         ),
         cells=dict(
             values=[
-                ["Наивный прогноз", "<b>ML (XGBoost)</b>"],
-                [f"{mae_naive:.2f}", f"<b>{mae_ml:.2f}</b>"],
-                [f"{rmse_naive:.2f}", f"<b>{rmse_ml:.2f}</b>"],
-                [f"{max_naive:.2f}", f"<b>{max_ml:.2f}</b>"],
-                [f"{mean_actual:.2f}", f"{mean_actual:.2f}"],
-                [f"{max_actual:.2f}", f"{max_actual:.2f}"]
+                ["М1. Историческая", "М2. Климатическая", "<b>М3. Комбинированная</b>"],
+                [f"{mae_m1:.2f}", f"{mae_m2:.2f}", f"<b>{mae_m3:.2f}</b>"],
+                [f"{rmse_m1:.2f}", f"{rmse_m2:.2f}", f"<b>{rmse_m3:.2f}</b>"],
+                [f"{max_m1:.2f}", f"{max_m2:.2f}", f"<b>{max_m3:.2f}</b>"],
+                [f"{mean_actual:.2f}", f"{mean_actual:.2f}", f"{mean_actual:.2f}"],
+                [f"{max_actual:.2f}", f"{max_actual:.2f}", f"{max_actual:.2f}"]
             ],
-            fill_color=['#ffffff', '#e8f5e9'], # Слегка зеленоватый фон для ML модели
-            align='center',
-            font=dict(size=14, color='black')
+            fill_color=['#ffffff', '#ffffff', '#e8f5e9'], # Выделяем М3 зеленым
+            align='center', font=dict(size=14, color='black')
         )
-    ),
-    row=2, col=1
+    ), row=4, col=1
 )
 
+# Настройка оформления
 fig.update_layout(
-    title_text="<b>Прогноз выработки солнечной электроэнергии (3-9 июня)</b><br><sup>Улучшение точности ML-модели: 86.2%</sup>",
-    title_x=0.5,
-    height=850,
-    template="plotly_white",
-    showlegend=True,
-    legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01),
-    margin=dict(l=40, r=40, t=80, b=40)
+    title_text="<b>Сравнение трех методов прогнозирования выработки</b>",
+    title_x=0.5, title_font=dict(size=24), height=1400,
+    template="plotly_white", showlegend=True,
+    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5, font=dict(size=16)),
+    margin=dict(l=60, r=60, t=120, b=60)
 )
 
+fig.update_xaxes(title_font=dict(size=16), tickfont=dict(size=14))
+fig.update_yaxes(title_font=dict(size=16), tickfont=dict(size=14))
 fig.update_yaxes(title_text="кВт", row=1, col=1)
+fig.update_yaxes(title_text="кВт", row=2, col=1)
+fig.update_yaxes(title_text="кВт", row=3, col=1)
 
-
+# ==========================================
+# 7. СОХРАНЕНИЕ И ОТКРЫТИЕ БЕЗ КЭША
+# ==========================================
 html_filename = "index.html"
 fig.write_html(html_filename)
 file_path = os.path.abspath(html_filename)
 
-print(f"\n✅ Успех! Файл сохранен по пути: {file_path}")
-print("\nТеперь вы можете:")
-print(f"1. Загрузить файл '{html_filename}' в ваш репозиторий на GitHub.")
-print("2. Зайти в Settings -> Pages (в настройках репозитория).")
-print("3. Выбрать ветку 'main' и папку '/ (root)'.")
-print("4. Через минуту ваш сайт будет доступен по ссылке!")
+print(f"\n✅ Успех! Файл сохранен: {file_path}")
+webbrowser.open(f"file://{file_path}?v={int(time.time())}")
+print("Готово!")
