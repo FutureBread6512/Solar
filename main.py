@@ -188,9 +188,7 @@ fig.update_layout(
 
 fig.update_yaxes(title_text="кВт", row=1, col=1)
 
-# ==========================================
-# 7. СОХРАНЕНИЕ В HTML (ДЛЯ GITHUB PAGES)
-# ==========================================
+
 html_filename = "index.html"
 fig.write_html(html_filename)
 file_path = os.path.abspath(html_filename)
